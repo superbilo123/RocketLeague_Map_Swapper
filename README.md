@@ -5,6 +5,7 @@ A Windows desktop app for loading custom Rocket League maps without touching gam
 ## What it does
 
 Custom maps for Rocket League are distributed as `.upk` files that replace the standard Underpass map (`Labs_Underpass_P.upk`). This tool manages that swap for you. It keeps a backup of your original Underpass file and restores it on demand, so you can switch between custom maps and the default without doing anything manually.
+To use the custom map, just select Underpass as your freeplay map and enjoy the loaded map.
 
 ## Requirements
 
