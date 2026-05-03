@@ -2,9 +2,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import json
 import os
+import re
 import shutil
 import threading
 import webbrowser
+import zipfile
 from PIL import Image, ImageTk
 
 # ── Windows DPI fix — makes the app crisp on high-DPI/modern screens ───────────
@@ -24,7 +26,8 @@ os.makedirs(_CONFIG_DIR, exist_ok=True)
 CONFIG_FILE     = os.path.join(_CONFIG_DIR, "config.json")
 MAPS_WEBSITE    = "https://bakkesplugins.com/maps"
 UPK_FILENAME    = "Labs_Underpass_P.upk"
-BACKUP_FILENAME = "Labs_Underpass_P_ORIGINAL_BACKUP.upk"
+BACKUP_FILENAME  = "Labs_Underpass_P.upk"
+BACKUP_SUBFOLDER = "_Standard Underpass (Backup)"
 
 DEFAULT_COOKED = r"C:\Program Files\Epic Games\rocketleague\TAGame\CookedPCConsole"
 
@@ -70,16 +73,72 @@ def save_config(cfg):
 
 # ── Utility ────────────────────────────────────────────────────────────────────
 def _find_upk(folder_path):
-    for f in os.listdir(folder_path):
-        if f.lower().endswith(".upk"):
-            return os.path.join(folder_path, f)
+    for root, _, files in os.walk(folder_path):
+        for f in files:
+            if f.lower().endswith((".upk", ".udk")):
+                return os.path.join(root, f)
     return None
 
-def _find_jfif(folder_path):
-    for f in os.listdir(folder_path):
-        if f.lower().endswith(".jfif"):
-            return os.path.join(folder_path, f)
+_PREVIEW_EXTS = (".jfif", ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")
+
+def _find_preview_image(folder_path):
+    for root, _, files in os.walk(folder_path):
+        for f in files:
+            if f.lower().endswith(_PREVIEW_EXTS):
+                return os.path.join(root, f)
     return None
+
+_MAP_JSON_NAMES   = {"mapinfo.json", "info.json", "map.json", "metadata.json"}
+_MAP_JSON_FIELDS  = {"title", "author", "description", "previewurl", "name", "desc"}
+_FIELD_ALIASES    = {"desc": "Description", "name": "Title",
+                     "map_name": "Title", "creator": "Author", "made_by": "Author"}
+
+def _find_map_json(folder_path):
+    fallback = None
+    for root, _, files in os.walk(folder_path):
+        for f in files:
+            if not f.lower().endswith(".json"):
+                continue
+            path = os.path.join(root, f)
+            if f.lower() in _MAP_JSON_NAMES:
+                return path
+            if fallback is None:
+                fallback = path
+    return fallback
+
+def _parse_map_json(json_path):
+    if json_path is None:
+        return None
+    raw = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with open(json_path, encoding=enc) as f:
+                text = f.read()
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError:
+                # Try repairing trailing commas before } or ]
+                fixed = re.sub(r",\s*([}\]])", r"\1", text)
+                raw = json.loads(fixed)
+            break
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+    if raw is None or not isinstance(raw, dict):
+        return None
+    normalised = {k.lower(): v for k, v in raw.items()}
+    if not _MAP_JSON_FIELDS.intersection(normalised):
+        return None
+    # Apply field aliases so non-standard keys map to standard ones
+    data = {}
+    for k, v in raw.items():
+        std_key = _FIELD_ALIASES.get(k.lower(), k.title())
+        val = (v or "") if isinstance(v, str) else ("" if v is None else v)
+        data.setdefault(std_key, val)
+    desc = str(data.get("Description", ""))
+    desc = re.sub(r"<br\s*/?>", "\n", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"<[^>]+>", "", desc).strip()
+    data["Description"] = desc
+    return data
 
 def _sep(parent, color=BORDER, height=1):
     tk.Frame(parent, bg=color, height=height).pack(fill="x")
@@ -250,16 +309,31 @@ class App(tk.Tk):
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>",
             lambda e: self.canvas.itemconfig(self._map_win, width=e.width))
-        self.canvas.bind_all("<MouseWheel>",
-            lambda e: self.canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+        self.canvas.bind("<Enter>",
+            lambda e: self.canvas.bind_all("<MouseWheel>", self._scroll_canvas))
+        self.canvas.bind("<Leave>",
+            lambda e: self.canvas.unbind_all("<MouseWheel>"))
 
-        # ── Vertical divider ─────────────────────────────────────────────────────
-        tk.Frame(content, bg=BORDER, width=1).pack(side="left", fill="y", padx=(10, 0))
+        # ── Draggable sash ───────────────────────────────────────────────────────
+        sash = tk.Frame(content, bg=BORDER, width=6, cursor="sb_h_double_arrow")
+        sash.pack(side="left", fill="y", padx=(8, 0))
 
         # ── Right: preview panel ─────────────────────────────────────────────────
-        preview_panel = tk.Frame(content, bg=SURFACE, width=PREVIEW_W)
-        preview_panel.pack(side="right", fill="y", padx=(10, 0))
-        preview_panel.pack_propagate(False)
+        self._preview_panel = tk.Frame(content, bg=SURFACE, width=PREVIEW_W)
+        self._preview_panel.pack(side="right", fill="y", padx=(8, 0))
+        self._preview_panel.pack_propagate(False)
+        preview_panel = self._preview_panel
+
+        def _sash_press(e):
+            sash._start_x = e.x_root
+            sash._start_w = self._preview_panel.winfo_width()
+        def _sash_drag(e):
+            delta = sash._start_x - e.x_root
+            self._preview_panel.config(width=max(180, min(600, sash._start_w + delta)))
+        sash.bind("<ButtonPress-1>", _sash_press)
+        sash.bind("<B1-Motion>",     _sash_drag)
+        sash.bind("<Enter>", lambda _: sash.config(bg=ACCENT))
+        sash.bind("<Leave>", lambda _: sash.config(bg=BORDER))
 
         tk.Label(preview_panel, text="PREVIEW", font=FONT_LABEL,
                  bg=SURFACE, fg=TEXT_DIM, anchor="w"
@@ -274,6 +348,15 @@ class App(tk.Tk):
         self._load_map_list()
         self._refresh_active_label()
 
+    def _backup_path(self):
+        maps_dir = self.maps_var.get()
+        if not maps_dir:
+            maps_dir = self.cfg.get("maps_dir", "")
+        return os.path.join(maps_dir, BACKUP_SUBFOLDER, BACKUP_FILENAME)
+
+    def _scroll_canvas(self, event):
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
     # ── Startup ────────────────────────────────────────────────────────────────
     def _startup_checks(self):
         self._check_bakkesmod_mods()
@@ -281,7 +364,7 @@ class App(tk.Tk):
     def _check_bakkesmod_mods(self):
         mods_path = os.path.join(self.cooked_var.get(), "mods")
         has = (os.path.isdir(mods_path) and
-               any(f.lower().endswith(".upk") for f in os.listdir(mods_path)))
+               any(f.lower().endswith((".upk", ".udk")) for f in os.listdir(mods_path)))
         if has and not self._warning_visible:
             self.warn_frame.pack(fill="x", after=self.winfo_children()[1])
             self._warning_visible = True
@@ -300,7 +383,7 @@ class App(tk.Tk):
             return
         moved, errors = 0, []
         for item in os.listdir(mods_path):
-            if item.lower().endswith(".upk"):
+            if item.lower().endswith((".upk", ".udk")):
                 src  = os.path.join(mods_path, item)
                 dest = os.path.join(maps_dir, os.path.splitext(item)[0])
                 os.makedirs(dest, exist_ok=True)
@@ -346,6 +429,7 @@ class App(tk.Tk):
         self._refresh_after_id = None
         for w in self.map_frame.winfo_children():
             w.destroy()
+        self.canvas.yview_moveto(0)
 
         maps_dir = self.maps_var.get()
         if not maps_dir or not os.path.isdir(maps_dir):
@@ -355,27 +439,39 @@ class App(tk.Tk):
             return
 
         maps = []
-        for folder in sorted(os.listdir(maps_dir)):
-            fpath = os.path.join(maps_dir, folder)
+        zips = []
+        for entry in sorted(os.listdir(maps_dir)):
+            if entry == BACKUP_SUBFOLDER:
+                continue
+            fpath = os.path.join(maps_dir, entry)
             if os.path.isdir(fpath):
                 upk = _find_upk(fpath)
                 if upk:
-                    maps.append((folder, fpath, upk))
+                    maps.append((entry, fpath, upk))
+            elif entry.lower().endswith((".upk", ".udk")):
+                maps.append((os.path.splitext(entry)[0], maps_dir, fpath))
+            elif entry.lower().endswith(".zip"):
+                zips.append((os.path.splitext(entry)[0], fpath))
 
         favs = self.cfg.get("favourites", [])
         if self.fav_only.get():
             maps = [m for m in maps if m[0] in favs]
         maps.sort(key=lambda m: (0 if m[0] in favs else 1, m[0].lower()))
 
-        if not maps:
+        if not maps and not zips:
             tk.Label(self.map_frame, text="No maps found in the selected folder.",
                      font=FONT_BODY, bg=SURFACE, fg=TEXT_DIM, pady=30).pack()
             return
 
         for i, (name, fpath, upk) in enumerate(maps):
-            self._build_row(i, name, fpath, upk, _find_jfif(fpath), favs)
+            json_path = _find_map_json(fpath) if os.path.isdir(fpath) else None
+            map_info  = _parse_map_json(json_path) if json_path else None
+            self._build_row(i, name, fpath, upk, _find_preview_image(fpath), favs, map_info)
 
-    def _build_row(self, idx, name, folder_path, upk, jfif, favs):
+        for i, (name, zip_path) in enumerate(zips):
+            self._build_zip_row(len(maps) + i, name, zip_path)
+
+    def _build_row(self, idx, name, folder_path, upk, jfif, favs, map_info=None):
         is_fav    = name in favs
         is_active = name == self.cfg.get("active_map", "")
         row_bg    = "#181c27" if idx % 2 == 0 else SURFACE
@@ -415,7 +511,7 @@ class App(tk.Tk):
             bg=btn_bg, fg=btn_fg,
             relief="flat", cursor="hand2", padx=14, pady=5, bd=0,
             activebackground=btn_hover, activeforeground=TEXT,
-            command=lambda n=name, fp=folder_path, u=upk, j=jfif: self._load_map(n, fp, u, j)
+            command=lambda n=name, fp=folder_path, u=upk, j=jfif, mi=map_info: self._load_map(n, fp, u, j, mi)
         )
         load_btn.pack(side="right")
         load_btn.bind("<Enter>", lambda e, b=load_btn, h=btn_hover: b.config(bg=h))
@@ -423,7 +519,7 @@ class App(tk.Tk):
 
         # ── Row click → show preview (anywhere except load_btn) ──────────────────
         for widget in (row, inner, name_lbl, upk_lbl):
-            widget.bind("<Button-1>", lambda e, n=name, j=jfif: self._show_preview_panel(n, j))
+            widget.bind("<Button-1>", lambda e, n=name, j=jfif, mi=map_info: self._show_preview_panel(n, j, mi))
 
         # ── Row hover ────────────────────────────────────────────────────────────
         def on_enter(e, r=row, ri=inner, orig=row_bg):
@@ -447,23 +543,83 @@ class App(tk.Tk):
 
         _sep(self.map_frame, BORDER, 1)
 
+    def _build_zip_row(self, idx, name, zip_path):
+        row_bg = "#181c27" if idx % 2 == 0 else SURFACE
+        row   = tk.Frame(self.map_frame, bg=row_bg)
+        row.pack(fill="x")
+        inner = tk.Frame(row, bg=row_bg)
+        inner.pack(fill="x", padx=14, pady=8)
+
+        tk.Label(inner, text="📦", font=("Trebuchet MS", 13),
+                 bg=row_bg).pack(side="left", padx=(4, 10))
+        tk.Label(inner, text=name, font=FONT_MAP,
+                 bg=row_bg, fg=TEXT_MID, anchor="w").pack(side="left", fill="x", expand=True)
+        tk.Label(inner, text=".zip", font=FONT_MONO,
+                 bg=row_bg, fg=TEXT_DIM).pack(side="left", padx=(0, 12))
+
+        ext_btn = tk.Button(
+            inner, text="⬇  Extract", font=FONT_BTN,
+            bg=SURFACE2, fg=TEXT_MID,
+            relief="flat", cursor="hand2", padx=14, pady=5, bd=0,
+            activebackground=BORDER, activeforeground=TEXT,
+            command=lambda zp=zip_path: self._extract_zip(zp)
+        )
+        ext_btn.pack(side="right")
+        ext_btn.bind("<Enter>", lambda _, b=ext_btn: b.config(bg=BORDER))
+        ext_btn.bind("<Leave>", lambda _, b=ext_btn: b.config(bg=SURFACE2))
+
+        _sep(self.map_frame, BORDER, 1)
+
+    def _extract_zip(self, zip_path):
+        maps_dir = self.maps_var.get()
+
+        def do_extract():
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    top_levels = {n.split("/")[0] for n in zf.namelist() if n}
+                    if len(top_levels) == 1 and not any(
+                        n.replace(next(iter(top_levels)), "").strip("/") == "" and not n.endswith("/")
+                        for n in zf.namelist()
+                    ):
+                        # Single top-level folder — extract directly into maps_dir
+                        zf.extractall(maps_dir)
+                    else:
+                        # Files at root — extract into a named subfolder
+                        dest = os.path.join(maps_dir, os.path.splitext(os.path.basename(zip_path))[0])
+                        os.makedirs(dest, exist_ok=True)
+                        zf.extractall(dest)
+                os.remove(zip_path)
+                self.after(0, self._load_map_list)
+            except PermissionError:
+                self.after(0, lambda: messagebox.showerror(
+                    APP_NAME,
+                    "Permission denied while extracting.\n\n"
+                    "The Maps Folder may require administrator access.\n"
+                    "Try moving your Maps Folder to somewhere like Documents or Desktop, "
+                    "or re-run this app as Administrator."))
+            except Exception as ex:
+                self.after(0, lambda: messagebox.showerror(APP_NAME, f"Extract failed:\n{ex}"))
+
+        threading.Thread(target=do_extract, daemon=True).start()
+
     # ── Load map ───────────────────────────────────────────────────────────────
-    def _load_map(self, name, folder_path, upk_path, jfif_path=None):
+    def _load_map(self, name, folder_path, upk_path, jfif_path=None, map_info=None):
         cooked = self.cooked_var.get()
         if not os.path.isdir(cooked):
             messagebox.showerror(APP_NAME, f"CookedPCConsole folder not found:\n{cooked}")
             return
         dest   = os.path.join(cooked, UPK_FILENAME)
-        backup = os.path.join(cooked, BACKUP_FILENAME)
+        backup = self._backup_path()
 
         def do_load():
             try:
                 if not os.path.exists(backup) and os.path.exists(dest):
+                    os.makedirs(os.path.dirname(backup), exist_ok=True)
                     shutil.copy2(dest, backup)
                 shutil.copy2(upk_path, dest)
                 self.cfg["active_map"] = name
                 save_config(self.cfg)
-                self.after(0, lambda: self._on_load_success(name, jfif_path))
+                self.after(0, lambda: self._on_load_success(name, jfif_path, map_info))
             except PermissionError:
                 self.after(0, lambda: messagebox.showerror(
                     APP_NAME, "Permission denied.\nTry running the app as Administrator."))
@@ -472,11 +628,11 @@ class App(tk.Tk):
 
         threading.Thread(target=do_load, daemon=True).start()
 
-    def _on_load_success(self, name, jfif_path=None):
+    def _on_load_success(self, name, jfif_path=None, map_info=None):
         self._refresh_active_label()
         self._load_map_list()
         self._animate_check()
-        self._show_preview_panel(name, jfif_path)
+        self._show_preview_panel(name, jfif_path, map_info)
 
     def _animate_check(self):
         if self._check_anim_id:
@@ -506,7 +662,7 @@ class App(tk.Tk):
                  font=FONT_BODY, bg=SURFACE, fg=TEXT_DIM,
                  justify="center").pack(expand=True)
 
-    def _show_preview_panel(self, name, jfif_path):
+    def _show_preview_panel(self, name, jfif_path, map_info=None):
         for w in self._preview_body.winfo_children():
             w.destroy()
 
@@ -525,14 +681,42 @@ class App(tk.Tk):
             tk.Label(self._preview_body, text="(no preview)",
                      font=FONT_SMALL, bg=SURFACE, fg=TEXT_DIM).pack(pady=(20, 6))
 
-        tk.Label(self._preview_body, text=name, font=FONT_MAP,
+        title = map_info.get("Title", name) if map_info else name
+        tk.Label(self._preview_body, text=title, font=FONT_MAP,
                  bg=SURFACE, fg=ACCENT, wraplength=PREVIEW_W - 24,
-                 justify="center").pack(padx=12, pady=(0, 12))
+                 justify="center").pack(padx=12, pady=(0, 4))
+
+        if map_info:
+            author = map_info.get("Author", "")
+            if author:
+                tk.Label(self._preview_body, text=f"by {author}", font=FONT_SMALL,
+                         bg=SURFACE, fg=TEXT_MID, wraplength=PREVIEW_W - 24,
+                         justify="center").pack(padx=12, pady=(0, 8))
+
+            desc = map_info.get("Description", "").strip()
+            if desc:
+                tk.Frame(self._preview_body, bg=BORDER, height=1).pack(fill="x", padx=12, pady=(0, 6))
+                tk.Label(self._preview_body, text="Description", font=FONT_LABEL,
+                         bg=ACCENT2, fg=TEXT, anchor="w", padx=8, pady=4
+                         ).pack(fill="x", padx=8, pady=(0, 4))
+                desc_frame = tk.Frame(self._preview_body, bg=SURFACE)
+                desc_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+                sb = tk.Scrollbar(desc_frame, orient="vertical",
+                                  bg=SURFACE2, troughcolor=SURFACE2, width=8)
+                txt = tk.Text(desc_frame, wrap="word", font=FONT_SMALL,
+                              bg=SURFACE2, fg=TEXT_MID, relief="flat",
+                              bd=0, highlightthickness=0, padx=6, pady=6,
+                              cursor="arrow", yscrollcommand=sb.set)
+                sb.config(command=txt.yview)
+                sb.pack(side="right", fill="y")
+                txt.pack(side="left", fill="both", expand=True)
+                txt.insert("1.0", desc)
+                txt.config(state="disabled")
 
     # ── Restore original ───────────────────────────────────────────────────────
     def _restore_original(self):
         cooked = self.cooked_var.get()
-        backup = os.path.join(cooked, BACKUP_FILENAME)
+        backup = self._backup_path()
         dest   = os.path.join(cooked, UPK_FILENAME)
         if not os.path.exists(backup):
             messagebox.showinfo(APP_NAME,
@@ -562,7 +746,7 @@ class App(tk.Tk):
     # ── Active map label + restore button state ─────────────────────────────────
     def _refresh_active_label(self):
         active     = self.cfg.get("active_map", "")
-        has_backup = os.path.exists(os.path.join(self.cooked_var.get(), BACKUP_FILENAME))
+        has_backup = os.path.exists(self._backup_path())
         self.active_lbl.config(
             text=active if active else "Standard Underpass",
             fg=GREEN if active else TEXT_DIM
