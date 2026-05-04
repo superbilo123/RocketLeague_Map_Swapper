@@ -1,10 +1,12 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import json
 import os
 import re
 import shutil
+import tempfile
 import threading
+import urllib.request
 import webbrowser
 import zipfile
 from PIL import Image, ImageTk
@@ -21,10 +23,22 @@ except Exception:
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_NAME        = "RL Map Swapper"
+APP_VERSION     = "1.0.2"
 _CONFIG_DIR     = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RLmapswapper-config")
 os.makedirs(_CONFIG_DIR, exist_ok=True)
 CONFIG_FILE     = os.path.join(_CONFIG_DIR, "config.json")
-MAPS_WEBSITE    = "https://bakkesplugins.com/maps"
+MAPS_WEBSITE         = "https://bakkesplugins.com/maps"
+TEXTURES_MOD_PAGE    = "https://videogamemods.com/vgm/rocketleague/mods/workshop-textures"
+TEXTURES_DOWNLOAD_URL = ("https://uploads.videogamemods.com/communities/vgm/mods/"
+                         "workshop-textures-8490c90c-fdce-4eb4-a30c-a9151f260c3d/files/"
+                         "1496064905_Workshop-textures.zip")
+_TEXTURES_UA         = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36")
+GITHUB_API_LATEST    = ("https://api.github.com/repos/superbilo123/"
+                        "RocketLeague_Map_Swapper/releases/latest")
+GITHUB_RELEASES_PAGE = "https://github.com/superbilo123/RocketLeague_Map_Swapper/releases"
+_SPINNER_FRAMES      = ["◐", "◓", "◑", "◒"]
 UPK_FILENAME    = "Labs_Underpass_P.upk"
 BACKUP_FILENAME  = "Labs_Underpass_P.upk"
 BACKUP_SUBFOLDER = "_Standard Underpass (Backup)"
@@ -165,8 +179,9 @@ class App(tk.Tk):
         self.geometry("1140x700")
         self.minsize(800, 500)
 
-        self._check_anim_id   = None
-        self._warning_visible = False
+        self._check_anim_id    = None
+        self._warning_visible  = False
+        self._tex_warn_visible = False
         self._refresh_after_id = None
 
         self._build_ui()
@@ -191,20 +206,63 @@ class App(tk.Tk):
         link.bind("<Enter>",    lambda _: link.config(fg=TEXT))
         link.bind("<Leave>",    lambda _: link.config(fg=ACCENT))
 
+        tk.Label(hdr_in, text="|", font=FONT_BODY, bg=SURFACE, fg=BORDER
+                 ).pack(side="right", padx=6)
+
+        self._upd_btn = tk.Label(hdr_in, text="🔄  Check for Updates",
+                                 font=FONT_BODY, bg=SURFACE, fg=TEXT_MID, cursor="hand2")
+        self._upd_btn.pack(side="right", padx=(0, 4))
+        self._upd_btn.bind("<Button-1>", lambda _: self._check_for_updates())
+        self._upd_btn.bind("<Enter>",    lambda _: self._upd_btn.config(fg=TEXT))
+        self._upd_btn.bind("<Leave>",    lambda _: self._upd_btn.config(fg=TEXT_MID))
+
+        tk.Label(hdr_in, text="|", font=FONT_BODY, bg=SURFACE, fg=BORDER
+                 ).pack(side="right", padx=6)
+
+        self._tex_btn = tk.Label(hdr_in, text="🖼  Get Workshop Textures",
+                                 font=FONT_BODY, bg=SURFACE, fg=TEXT_MID, cursor="hand2")
+        self._tex_btn.pack(side="right", padx=(0, 4))
+        self._tex_btn.bind("<Button-1>", lambda _: self._install_workshop_textures())
+        self._tex_btn.bind("<Enter>",    lambda _: self._tex_btn.config(fg=TEXT))
+        self._tex_btn.bind("<Leave>",    lambda _: self._tex_btn.config(fg=TEXT_MID))
+
         _sep(self, BORDER, 2)
 
-        # ── BakkesMod warning banner (hidden until needed) ──────────────────────
-        self.warn_frame = tk.Frame(self, bg="#2a1a0e")
+        # ── Banner container (stacks all warning banners, avoids overlap) ────────
+        self._banners_frame = tk.Frame(self, bg=BG)
+        self._banners_frame.pack(fill="x")
+
+        # BakkesMod mods-folder banner (hidden until needed)
+        self.warn_frame = tk.Frame(self._banners_frame, bg="#2a1a0e")
         tk.Label(self.warn_frame,
-                 text="⚠️  BakkesMod mods folder detected — this may block custom maps.",
+                 text="Warning: BakkesMod mods folder detected. This may block custom maps.",
                  font=FONT_BODY, bg="#2a1a0e", fg="#f5a742", anchor="w"
                  ).pack(side="left", padx=16, pady=10)
-        tk.Button(self.warn_frame, text="Migrate to Maps Folder →",
+        tk.Button(self.warn_frame, text="Migrate to Maps Folder",
                   font=FONT_BTN, bg="#4a2e10", fg=GOLD,
                   relief="flat", cursor="hand2", padx=10, pady=4,
                   activebackground="#6a3e18", activeforeground=GOLD,
                   command=self._migrate_mods
                   ).pack(side="right", padx=12, pady=8)
+
+        # Workshop textures banner (hidden until needed)
+        self.tex_warn_frame = tk.Frame(self._banners_frame, bg="#0e1e2a")
+        tk.Label(self.tex_warn_frame,
+                 text="Workshop textures not detected. Custom maps may appear broken without them.",
+                 font=FONT_BODY, bg="#0e1e2a", fg="#74b8f5", anchor="w"
+                 ).pack(side="left", padx=16, pady=10)
+        tk.Button(self.tex_warn_frame, text="I already have them",
+                  font=FONT_BTN, bg="#0a1824", fg=TEXT_MID,
+                  relief="flat", cursor="hand2", padx=10, pady=4,
+                  activebackground="#152030", activeforeground=TEXT,
+                  command=self._dismiss_tex_warning
+                  ).pack(side="right", padx=(4, 12), pady=8)
+        tk.Button(self.tex_warn_frame, text="Download Textures Now",
+                  font=FONT_BTN, bg="#1a3a5c", fg="#74b8f5",
+                  relief="flat", cursor="hand2", padx=10, pady=4,
+                  activebackground="#254d78", activeforeground=TEXT,
+                  command=self._install_workshop_textures
+                  ).pack(side="right", padx=0, pady=8)
 
         # ── Settings ────────────────────────────────────────────────────────────
         sett = tk.Frame(self, bg=SURFACE2)
@@ -348,6 +406,158 @@ class App(tk.Tk):
         self._load_map_list()
         self._refresh_active_label()
 
+    # ── Update check ──────────────────────────────────────────────────────────
+    def _check_for_updates(self):
+        if getattr(self, "_upd_checking", False):
+            return
+        self._upd_checking = True
+        self._upd_spinner_idx = 0
+        self._upd_spinner_id  = None
+        self._upd_spin()
+        threading.Thread(target=self._do_check_updates, daemon=True).start()
+
+    def _upd_spin(self):
+        frame = _SPINNER_FRAMES[self._upd_spinner_idx % len(_SPINNER_FRAMES)]
+        self._upd_btn.config(text=f"{frame}  Checking...", fg=GREEN)
+        self._upd_spinner_idx += 1
+        self._upd_spinner_id = self.after(120, self._upd_spin)
+
+    def _upd_spin_stop(self):
+        if self._upd_spinner_id:
+            self.after_cancel(self._upd_spinner_id)
+            self._upd_spinner_id = None
+        self._upd_btn.config(text="🔄  Check for Updates", fg=TEXT_MID)
+        self._upd_checking = False
+
+    def _do_check_updates(self):
+        try:
+            req = urllib.request.Request(
+                GITHUB_API_LATEST,
+                headers={"User-Agent": _TEXTURES_UA,
+                         "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            tag = data.get("tag_name", "").lstrip("v")
+            if not tag:
+                raise RuntimeError("No release tag found.")
+        except Exception as ex:
+            self.after(0, lambda m=str(ex): self._upd_error(m))
+            return
+
+        def _finish(tag=tag):
+            self._upd_spin_stop()
+            current = tuple(int(x) for x in APP_VERSION.split("."))
+            latest  = tuple(int(x) for x in tag.split("."))
+            if latest <= current:
+                messagebox.showinfo(APP_NAME,
+                    f"You are on the latest version (v{APP_VERSION}).")
+            else:
+                if messagebox.askyesno(APP_NAME,
+                        f"A new version is available: v{tag}\n"
+                        f"You have: v{APP_VERSION}\n\n"
+                        "Open the releases page to download the update?"):
+                    webbrowser.open(GITHUB_RELEASES_PAGE)
+        self.after(0, _finish)
+
+    def _upd_error(self, msg):
+        self._upd_spin_stop()
+        messagebox.showerror(APP_NAME,
+            f"Could not check for updates:\n{msg}\n\n"
+            "Check your internet connection or visit the releases page manually.")
+
+    # ── Workshop Textures ──────────────────────────────────────────────────────
+    def _install_workshop_textures(self):
+        cooked = self.cooked_var.get()
+        if not os.path.isdir(cooked):
+            messagebox.showerror(APP_NAME,
+                f"CookedPCConsole folder not found:\n{cooked}\n\n"
+                "Set it above and save first.")
+            return
+        threading.Thread(target=self._do_install_textures, args=(cooked,), daemon=True).start()
+
+    def _do_install_textures(self, cooked):
+        self.after(0, lambda: self._tex_btn.config(text="⏳  Downloading…", fg=GOLD))
+        try:
+            zip_path = self._download_textures_zip()
+        except Exception as ex:
+            msg = (f"Download failed:\n{ex}\n\n"
+                   "You can download the zip manually from:\n"
+                   f"{TEXTURES_MOD_PAGE}\n"
+                   "then use 'Install from zip…' to finish.")
+            self.after(0, lambda m=msg: self._tex_install_failed(m))
+            return
+
+        self.after(0, lambda: self._tex_btn.config(text="📦  Installing…", fg=GOLD))
+        try:
+            installed, skipped, all_names = self._extract_textures(zip_path, cooked)
+        except Exception as ex:
+            msg = f"Install failed:\n{ex}"
+            self.after(0, lambda m=msg: self._tex_install_failed(m))
+            return
+        finally:
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+
+        def _done(installed=installed, skipped=skipped, all_names=all_names):
+            self.cfg["textures_installed"] = True
+            self.cfg["texture_files"] = all_names
+            save_config(self.cfg)
+            self._tex_btn.config(text="🖼  Get Workshop Textures", fg=TEXT_MID)
+            if self._tex_warn_visible:
+                self.tex_warn_frame.pack_forget()
+                self._tex_warn_visible = False
+            if installed == 0 and skipped > 0:
+                messagebox.showinfo(APP_NAME,
+                    f"Workshop textures are already installed ({skipped} file(s) present).\n"
+                    "Nothing was changed.")
+            else:
+                msg = f"Installed {installed} texture file(s) to CookedPCConsole."
+                if skipped:
+                    msg += f"\n{skipped} file(s) were already present and skipped."
+                messagebox.showinfo(APP_NAME, msg)
+        self.after(0, _done)
+
+    def _download_textures_zip(self):
+        req = urllib.request.Request(TEXTURES_DOWNLOAD_URL,
+                                     headers={"User-Agent": _TEXTURES_UA,
+                                              "Referer": TEXTURES_MOD_PAGE})
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp.close()
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp.name, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        return tmp.name
+
+    def _extract_textures(self, zip_path, cooked):
+        installed = skipped = 0
+        all_names = []
+        with zipfile.ZipFile(zip_path) as zf:
+            upk_entries = [n for n in zf.namelist()
+                           if n.lower().endswith((".upk", ".udk"))
+                           and not n.endswith("/")]
+            if not upk_entries:
+                raise RuntimeError("No .upk/.udk files found inside the downloaded zip.")
+            for entry in upk_entries:
+                fname = os.path.basename(entry)
+                all_names.append(fname)
+                dest  = os.path.join(cooked, fname)
+                if os.path.exists(dest):
+                    skipped += 1
+                    continue
+                data = zf.read(entry)
+                with open(dest, "wb") as f:
+                    f.write(data)
+                installed += 1
+        return installed, skipped, all_names
+
+    def _tex_install_failed(self, msg):
+        self._tex_btn.config(text="🖼  Get Workshop Textures", fg=TEXT_MID)
+        result = messagebox.askokcancel(APP_NAME,
+            msg + "\n\nOpen the mod page in browser?")
+        if result:
+            webbrowser.open(TEXTURES_MOD_PAGE)
+
     def _backup_path(self):
         maps_dir = self.maps_var.get()
         if not maps_dir:
@@ -360,17 +570,36 @@ class App(tk.Tk):
     # ── Startup ────────────────────────────────────────────────────────────────
     def _startup_checks(self):
         self._check_bakkesmod_mods()
+        self._check_workshop_textures()
 
     def _check_bakkesmod_mods(self):
         mods_path = os.path.join(self.cooked_var.get(), "mods")
-        has = (os.path.isdir(mods_path) and
-               any(f.lower().endswith((".upk", ".udk")) for f in os.listdir(mods_path)))
+        has = os.path.isdir(mods_path) and _find_upk(mods_path) is not None
         if has and not self._warning_visible:
-            self.warn_frame.pack(fill="x", after=self.winfo_children()[1])
+            self.warn_frame.pack(fill="x")
             self._warning_visible = True
         elif not has and self._warning_visible:
             self.warn_frame.pack_forget()
             self._warning_visible = False
+
+    def _check_workshop_textures(self):
+        installed = self.cfg.get("textures_installed", False)
+        if installed:
+            saved = self.cfg.get("texture_files", [])
+            cooked = self.cooked_var.get()
+            if not saved or all(os.path.exists(os.path.join(cooked, f)) for f in saved):
+                return
+        if not self._tex_warn_visible:
+            self.tex_warn_frame.pack(fill="x")
+            self._tex_warn_visible = True
+
+    def _dismiss_tex_warning(self):
+        self.cfg["textures_installed"] = True
+        if "texture_files" not in self.cfg:
+            self.cfg["texture_files"] = []
+        save_config(self.cfg)
+        self.tex_warn_frame.pack_forget()
+        self._tex_warn_visible = False
 
     def _migrate_mods(self):
         mods_path = os.path.join(self.cooked_var.get(), "mods")
@@ -381,20 +610,48 @@ class App(tk.Tk):
         if not os.path.isdir(maps_dir):
             messagebox.showerror(APP_NAME, "Please set a valid Maps Folder first.")
             return
-        moved, errors = 0, []
+        if os.path.normcase(os.path.abspath(maps_dir)) == os.path.normcase(os.path.abspath(mods_path)):
+            messagebox.showinfo(APP_NAME, "Maps Folder and mods folder are the same — nothing to do.")
+            return
+        moved, errors, delete_fails = 0, [], []
         for item in os.listdir(mods_path):
-            if item.lower().endswith((".upk", ".udk")):
-                src  = os.path.join(mods_path, item)
-                dest = os.path.join(maps_dir, os.path.splitext(item)[0])
-                os.makedirs(dest, exist_ok=True)
+            src = os.path.join(mods_path, item)
+            if os.path.isfile(src) and item.lower().endswith((".upk", ".udk")):
+                dest_dir = os.path.join(maps_dir, os.path.splitext(item)[0])
+                os.makedirs(dest_dir, exist_ok=True)
                 try:
-                    shutil.move(src, os.path.join(dest, item))
+                    shutil.copyfile(src, os.path.join(dest_dir, item))
                     moved += 1
+                    try:
+                        os.remove(src)
+                    except Exception:
+                        delete_fails.append(item)
                 except Exception as ex:
                     errors.append(str(ex))
-        msg = f"Moved {moved} map(s) to your Maps Folder."
+            elif os.path.isdir(src) and _find_upk(src) is not None:
+                dest_dir = os.path.join(maps_dir, item)
+                try:
+                    for dirpath, _, filenames in os.walk(src):
+                        rel = os.path.relpath(dirpath, src)
+                        target = os.path.join(dest_dir, rel) if rel != "." else dest_dir
+                        os.makedirs(target, exist_ok=True)
+                        for fname in filenames:
+                            shutil.copyfile(os.path.join(dirpath, fname), os.path.join(target, fname))
+                    moved += 1
+                    try:
+                        shutil.rmtree(src)
+                    except Exception:
+                        delete_fails.append(item)
+                except Exception as ex:
+                    errors.append(str(ex))
+        msg = f"Copied {moved} map(s) to your Maps Folder."
+        if delete_fails:
+            msg += (f"\n\n{len(delete_fails)} original(s) could not be removed from the mods "
+                    f"folder (access denied).\nDelete them manually, or right-click the app "
+                    f"and run as Administrator:\n" + "\n".join(delete_fails[:5]))
         if errors:
-            msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors[:3])
+            msg += (f"\n\n{len(errors)} error(s) — if these are access denied, "
+                    f"right-click the app and run as Administrator:\n" + "\n".join(errors[:3]))
         messagebox.showinfo(APP_NAME, msg)
         self._load_map_list()
         self._check_bakkesmod_mods()
